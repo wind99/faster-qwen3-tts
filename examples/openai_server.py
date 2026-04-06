@@ -13,25 +13,40 @@ Usage:
         --ref-audio voice.wav --ref-text "Reference transcription" \\
         --language English
 
-    # Multiple named voices from a JSON config:
+    # Multiple named voices from a JSON config (voice clone):
     python examples/openai_server.py --voices voices.json
 
-    # Custom model and port:
+    # Qwen3-TTS CustomVoice (preset speakers, no ref_audio / ref_text):
     python examples/openai_server.py \\
-        --model Qwen/Qwen3-TTS-12Hz-0.6B-Base \\
+        --model /path/to/Qwen3-TTS-12Hz-0.6B-CustomVoice \\
+        --default-speaker serena --language English
+
+    # CustomVoice with named API voices (voices.json):
+    # {"alloy": {"speaker": "serena", "language": "English"},
+    #  "echo":  {"speaker": "aiden", "language": "English"}}
+
+    # Custom model and port (Base = voice clone, needs ref):
+    python examples/openai_server.py \\
+        --model Qwen/Qwen3-TTS-12Hz-1.7B-Base \\
         --ref-audio voice.wav --ref-text "transcript" \\
         --port 8000
 
-Voices config (voices.json):
+Voices config (voices.json) — voice clone:
     {
         "alloy": {"ref_audio": "voice.wav", "ref_text": "...", "language": "English"},
         "echo":  {"ref_audio": "voice2.wav", "ref_text": "...", "language": "English"}
     }
 
-API usage:
+API usage (OpenAI-compatible; extensions for Qwen CustomVoice):
     curl -s http://localhost:8000/v1/audio/speech \\
         -H "Content-Type: application/json" \\
-        -d '{"model": "tts-1", "input": "Hello!", "voice": "alloy", "response_format": "wav"}' \\
+        -d '{"model": "tts-1", "input": "Hello!", "voice": "serena", "response_format": "wav"}' \\
+        --output speech.wav
+
+    Per-request language and instruction (1.7B CustomVoice; 0.6B ignores instruction):
+    curl -s http://localhost:8000/v1/audio/speech \\
+        -H "Content-Type: application/json" \\
+        -d '{"input": "你好", "voice": "Serena", "language": "Chinese", "instruction": "请用温柔的语气"}' \\
         --output speech.wav
 """
 import argparse
@@ -51,7 +66,7 @@ import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response, StreamingResponse
-from pydantic import BaseModel
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -67,8 +82,11 @@ app = FastAPI(title="faster-qwen3-tts OpenAI-compatible API")
 tts_model = None
 voices: dict = {}
 default_voice: Optional[str] = None
+generation_mode: str = "voice_clone"  # voice_clone | custom_voice
 SAMPLE_RATE = 24000  # updated once the model loads
 _model_lock = threading.Lock()  # prevent concurrent GPU inference
+# Fallback if a voice entry omits language (normally set at startup / per-request).
+_server_default_language: str = "Chinese"
 
 # ---------------------------------------------------------------------------
 # Request / response models
@@ -76,11 +94,24 @@ _model_lock = threading.Lock()  # prevent concurrent GPU inference
 
 
 class SpeechRequest(BaseModel):
+    """OpenAI /v1/audio/speech body. Extra fields ignored for client compatibility."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
     model: str = "tts-1"
     input: str
     voice: str = "alloy"
     response_format: str = "wav"  # wav | pcm | mp3
-    speed: float = 1.0           # accepted but not yet applied
+    speed: float = 1.0  # accepted but not yet applied
+    # Qwen3-TTS extensions (not in OpenAI spec; clients like OpenWebUI may omit):
+    language: Optional[str] = None
+    """Override synthesis language per request (e.g. Chinese, English)."""
+
+    instruction: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("instruction", "instruct"),
+    )
+    """Style / dialect hint for CustomVoice (1.7B); same as CLI --instruct. 0.6B ignores it."""
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +178,9 @@ def resolve_voice(voice_name: str) -> dict:
     """Return voice config dict or fall back to default, else raise 400."""
     if voice_name in voices:
         return voices[voice_name]
+    key = voice_name.strip().lower()
+    if key and key in voices:
+        return voices[key]
     if default_voice and default_voice in voices:
         logger.warning(
             "Voice %r not configured; falling back to default voice %r",
@@ -161,6 +195,28 @@ def resolve_voice(voice_name: str) -> dict:
             f"Available voices: {list(voices.keys())}"
         ),
     )
+
+
+def effective_voice_cfg(req: "SpeechRequest") -> dict:
+    """Merge voices registry entry with per-request language / instruction overrides."""
+    cfg = dict(resolve_voice(req.voice))
+    if req.language is not None and str(req.language).strip():
+        cfg["language"] = str(req.language).strip()
+    if req.instruction is not None and str(req.instruction).strip():
+        cfg["instruct"] = str(req.instruction).strip()
+    return cfg
+
+
+def _register_custom_voice_speaker_aliases(supported: list, lang: str) -> None:
+    """Allow voice=<speaker_id> with any casing (e.g. Serena -> serena)."""
+    global voices
+    for spk in supported:
+        if not spk or not isinstance(spk, str):
+            continue
+        ent = {"speaker": spk, "language": lang}
+        voices.setdefault(spk.lower(), dict(ent))
+        if spk != spk.lower():
+            voices.setdefault(spk, dict(ent))
 
 
 # ---------------------------------------------------------------------------
@@ -179,14 +235,25 @@ async def _stream_chunks(voice_cfg: dict, text: str) -> AsyncGenerator[bytes, No
     def producer():
         try:
             with _model_lock:
-                for chunk, _sr, _timing in tts_model.generate_voice_clone_streaming(
-                    text=text,
-                    language=voice_cfg.get("language", "Auto"),
-                    ref_audio=voice_cfg["ref_audio"],
-                    ref_text=voice_cfg.get("ref_text", ""),
-                    chunk_size=voice_cfg.get("chunk_size", 12),
-                    non_streaming_mode=False,
-                ):
+                if generation_mode == "custom_voice":
+                    stream = tts_model.generate_custom_voice_streaming(
+                        text=text,
+                        speaker=voice_cfg["speaker"],
+                        language=voice_cfg.get("language", _server_default_language),
+                        instruct=voice_cfg.get("instruct") or None,
+                        chunk_size=voice_cfg.get("chunk_size", 12),
+                        non_streaming_mode=False,
+                    )
+                else:
+                    stream = tts_model.generate_voice_clone_streaming(
+                        text=text,
+                        language=voice_cfg.get("language", _server_default_language),
+                        ref_audio=voice_cfg["ref_audio"],
+                        ref_text=voice_cfg.get("ref_text", ""),
+                        chunk_size=voice_cfg.get("chunk_size", 12),
+                        non_streaming_mode=False,
+                    )
+                for chunk, _sr, _timing in stream:
                     q.put(chunk)
         except Exception as exc:
             q.put(exc)
@@ -213,7 +280,15 @@ async def _stream_chunks(voice_cfg: dict, text: str) -> AsyncGenerator[bytes, No
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model_loaded": tts_model is not None}
+    out: dict = {"status": "ok", "model_loaded": tts_model is not None}
+    if tts_model is not None:
+        out["generation_mode"] = generation_mode
+        if generation_mode == "custom_voice":
+            try:
+                out["speakers"] = tts_model.model.get_supported_speakers() or []
+            except Exception:
+                out["speakers"] = []
+    return out
 
 
 @app.post("/v1/audio/speech")
@@ -223,7 +298,7 @@ async def create_speech(req: SpeechRequest):
     if not req.input.strip():
         raise HTTPException(status_code=400, detail="'input' text is empty")
 
-    voice_cfg = resolve_voice(req.voice)
+    voice_cfg = effective_voice_cfg(req)
     fmt = req.response_format.lower()
 
     _CONTENT_TYPES = {
@@ -244,9 +319,16 @@ async def create_speech(req: SpeechRequest):
 
         def _generate():
             with _model_lock:
+                if generation_mode == "custom_voice":
+                    return tts_model.generate_custom_voice(
+                        text=req.input,
+                        speaker=voice_cfg["speaker"],
+                        language=voice_cfg.get("language", _server_default_language),
+                        instruct=voice_cfg.get("instruct") or None,
+                    )
                 return tts_model.generate_voice_clone(
                     text=req.input,
-                    language=voice_cfg.get("language", "Auto"),
+                    language=voice_cfg.get("language", _server_default_language),
                     ref_audio=voice_cfg["ref_audio"],
                     ref_text=voice_cfg.get("ref_text", ""),
                 )
@@ -285,23 +367,41 @@ def _parse_args():
         "--voices",
         default=os.environ.get("QWEN_TTS_VOICES"),
         metavar="FILE",
-        help="JSON file mapping voice names to {ref_audio, ref_text, language}",
+        help=(
+            "JSON voice registry. Voice clone: {ref_audio, ref_text, language}. "
+            "CustomVoice: {speaker, language}[, instruct]"
+        ),
     )
     p.add_argument(
         "--ref-audio",
         default=os.environ.get("QWEN_TTS_REF_AUDIO"),
         metavar="FILE",
-        help="Reference audio file when --voices is not used",
+        help="Reference audio (voice-clone models only; not used for CustomVoice)",
     )
     p.add_argument(
         "--ref-text",
         default=os.environ.get("QWEN_TTS_REF_TEXT", ""),
-        help="Transcript of --ref-audio",
+        help="Transcript of --ref-audio (voice clone only)",
+    )
+    p.add_argument(
+        "--default-speaker",
+        default=os.environ.get("QWEN_TTS_DEFAULT_SPEAKER"),
+        metavar="NAME",
+        help=(
+            "Preset speaker id for CustomVoice when --voices is not used "
+            "(e.g. serena, aiden). If omitted, uses the model's first supported speaker."
+        ),
     )
     p.add_argument(
         "--language",
-        default=os.environ.get("QWEN_TTS_LANGUAGE", "Auto"),
-        help="Target language (English, French, Auto, …) when --voices is not used",
+        default=os.environ.get("QWEN_TTS_LANGUAGE", "Chinese"),
+        metavar="LANG",
+        help=(
+            "Default synthesis language for all voices (default: Chinese). "
+            "Override per request with JSON field \"language\". "
+            "Also settable via env QWEN_TTS_LANGUAGE. "
+            "Use English / Auto / other codes as supported by the model."
+        ),
     )
     p.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
     p.add_argument("--port", type=int, default=8000, help="Bind port (default: 8000)")
@@ -309,33 +409,79 @@ def _parse_args():
     return p.parse_args()
 
 
-def main():
-    global tts_model, voices, default_voice, SAMPLE_RATE
+def _detect_generation_mode(model_wrapper) -> str:
+    inner = getattr(model_wrapper.model, "model", None)
+    tts_type = getattr(inner, "tts_model_type", None) if inner is not None else None
+    if tts_type == "custom_voice":
+        return "custom_voice"
+    return "voice_clone"
 
-    args = _parse_args()
 
-    # Build voice registry
+def _build_voices_custom_voice(args, model_wrapper) -> None:
+    global voices, default_voice
+
+    supported = []
+    try:
+        supported = model_wrapper.model.get_supported_speakers() or []
+    except Exception as exc:
+        logger.warning("Could not list supported speakers: %s", exc)
+
     if args.voices:
         with open(args.voices) as f:
             voices = json.load(f)
         default_voice = next(iter(voices))
-        logger.info("Loaded %d voice(s) from %s", len(voices), args.voices)
-    elif args.ref_audio:
-        voices = {
-            "default": {
-                "ref_audio": args.ref_audio,
-                "ref_text": args.ref_text,
-                "language": args.language,
-            }
+        for name, cfg in voices.items():
+            if "speaker" not in cfg:
+                print(
+                    f"ERROR: voice {name!r} missing 'speaker' (CustomVoice voices.json).",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            if "language" not in cfg:
+                cfg["language"] = (
+                    args.language if args.language.lower() != "auto" else "English"
+                )
+        lang_aliases = next(iter(voices.values()))["language"]
+        _register_custom_voice_speaker_aliases(supported, lang_aliases)
+        logger.info("Loaded %d CustomVoice preset(s) from %s", len(voices), args.voices)
+        return
+
+    speaker = args.default_speaker
+    if not speaker:
+        if not supported:
+            print(
+                "ERROR: CustomVoice model but no speakers reported; set --default-speaker.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        speaker = supported[0]
+        logger.info("Using first supported speaker as default: %s", speaker)
+
+    lang = args.language
+    if lang.lower() == "auto":
+        lang = "English"
+
+    voices = {
+        "default": {
+            "speaker": speaker,
+            "language": lang,
         }
-        default_voice = "default"
-        logger.info("Using single voice from --ref-audio: %s", args.ref_audio)
-    else:
-        print(
-            "ERROR: provide --ref-audio <file> or --voices <config.json>",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    }
+    default_voice = "default"
+    _register_custom_voice_speaker_aliases(supported, lang)
+    logger.info("CustomVoice default: speaker=%s language=%s", speaker, lang)
+    if supported:
+        logger.info("Supported speakers: %s", ", ".join(supported))
+
+
+def main():
+    global tts_model, voices, default_voice, SAMPLE_RATE, generation_mode
+    global _server_default_language
+
+    args = _parse_args()
+    _server_default_language = (
+        "English" if args.language.lower() == "auto" else args.language
+    )
 
     from faster_qwen3_tts import FasterQwen3TTS
 
@@ -345,6 +491,34 @@ def main():
         device=args.device,
         dtype=torch.bfloat16,
     )
+    generation_mode = _detect_generation_mode(tts_model)
+    logger.info("Generation mode: %s", generation_mode)
+
+    if generation_mode == "custom_voice":
+        _build_voices_custom_voice(args, tts_model)
+    else:
+        if args.voices:
+            with open(args.voices) as f:
+                voices = json.load(f)
+            default_voice = next(iter(voices))
+            logger.info("Loaded %d voice(s) from %s", len(voices), args.voices)
+        elif args.ref_audio:
+            voices = {
+                "default": {
+                    "ref_audio": args.ref_audio,
+                    "ref_text": args.ref_text,
+                    "language": args.language,
+                }
+            }
+            default_voice = "default"
+            logger.info("Using single voice from --ref-audio: %s", args.ref_audio)
+        else:
+            print(
+                "ERROR: voice-clone model requires --ref-audio or --voices <config.json>",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
     SAMPLE_RATE = tts_model.sample_rate
     logger.info("Model ready. Sample rate: %d Hz", SAMPLE_RATE)
     logger.info("Server listening on http://%s:%d", args.host, args.port)
